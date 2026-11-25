@@ -4,11 +4,18 @@
 
 ## 安装与运行
 
-服务器上的项目目录包含 `crossdrone-data/` 时，激活已有 Python 环境后使用双卡脚本。脚本使用 GPU 0 和 1，输出到 `runs/crossdrone-resnet50/`。终端显示训练轮次、批次进度、剩余时间和训练损失。重定向到日志时，默认每 50 批及每阶段结束记录一次进度。
+服务器上的项目目录包含 `crossdrone-data/` 时，激活已有 Python 环境后使用双卡脚本。脚本使用 GPU 0 和 1，输出到 `runs/crossdrone-resnet50/`。Rich 进度条区分训练和验证，并显示轮次、批次、已用时间、预计剩余时间和训练损失。直接在终端运行时实时刷新，重定向到日志时默认每 50 批及每阶段结束记录一次进度。
 
 ```bash
 bash train_crossdrone.sh
 bash train_crossdrone.sh --resume
+```
+
+CUDA 双卡的 NCCL 同步遇到问题时，可以用同一启动脚本尝试 Gloo 后端。先用少量数据验证当前 PyTorch 构建的 CUDA 通信支持。
+
+```bash
+GLOO_SOCKET_IFNAME=lo bash train_crossdrone.sh --distributed-backend gloo \
+  --epochs 1 --limit-train 8 --limit-val 8 --output runs/startup-check-gloo
 ```
 
 在项目根目录执行。Python 3.10 或以上可用。CUDA 环境使用与你的驱动匹配的 PyTorch 和 torchvision。

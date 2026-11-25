@@ -39,6 +39,8 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=defaults.weight_decay)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:N or mps")
+    parser.add_argument("--distributed-backend", choices=("nccl", "gloo"),
+                        help="override the process group backend (default: NCCL for CUDA, Gloo for CPU)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--confidence-threshold", type=float, default=0.5)
     parser.add_argument("--association-iou", type=float, default=0.5)
@@ -63,16 +65,19 @@ def parse_args():
     return args
 
 
-def setup_device(spec, world_size):
+def setup_device(spec, world_size, backend=None):
     device = resolve_device(spec)
     if world_size > 1:
         if device.type == "mps" or device.index is not None:
             raise ValueError("torchrun requires --device cuda or --device cpu")
+        if backend == "nccl" and device.type != "cuda":
+            raise ValueError("the NCCL backend requires CUDA")
         if device.type == "cuda":
             device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
             torch.cuda.set_device(device)
         dist.init_process_group(
-            backend="nccl" if device.type == "cuda" else "gloo", timeout=timedelta(hours=2)
+            backend=backend or ("nccl" if device.type == "cuda" else "gloo"),
+            timeout=timedelta(hours=2),
         )
     return device
 
@@ -118,7 +123,10 @@ def run(args, data, audit, splits, world_size, rank, device):
             f"Data ready: {len(loader.dataset)} training pairs, {len(val_loader.dataset)} validation pairs"
         )
         write_json(output / "data_audit.json", audit)
-        write_json(output / "config.json", {**settings, "epochs": args.epochs})
+        write_json(output / "config.json", {
+            **settings, "epochs": args.epochs,
+            "distributed_backend": dist.get_backend() if dist.is_initialized() else None,
+        })
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -196,8 +204,9 @@ def main():
         return
 
     if rank == 0 and world_size > 1:
-        report_startup(f"Initializing the distributed process group ({world_size} processes)")
-    device = setup_device(args.device, world_size)
+        backend = args.distributed_backend or "default backend"
+        report_startup(f"Initializing the distributed process group ({world_size} processes, {backend})")
+    device = setup_device(args.device, world_size, args.distributed_backend)
     try:
         run(args, data, audit, splits, world_size, rank, device)
     finally:

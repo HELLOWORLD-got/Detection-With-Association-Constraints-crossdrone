@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
 import json
 from pathlib import Path
-import sys
 from time import monotonic
 
+from rich.console import Console
+from rich.progress import (
+    BarColumn, MofNCompleteColumn, Progress, TaskProgressColumn, TextColumn,
+    TimeElapsedColumn, TimeRemainingColumn,
+)
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -18,17 +21,37 @@ from .metrics import AssociationMetrics, DetectionMetrics, decode
 
 
 class BatchProgress:
-    """Update a terminal line or emit periodic lines to redirected logs."""
+    """Display live terminal progress or periodic snapshots in redirected logs."""
 
-    def __init__(self, label, total, log_every):
-        self.label = label
+    def __init__(self, label, total, log_every, *, color="cyan"):
         self.total = total
-        self.log_every = log_every
-        self.interactive = sys.stderr.isatty()
-        self.started = monotonic()
-        self.last_update = self.started
-        if self.interactive and self.log_every:
-            self.update(0)
+        self.log_every = log_every if label else 0
+        self.console = Console(stderr=True) if self.log_every else None
+        self.interactive = self.console is not None and self.console.is_terminal
+        self.last_update = monotonic()
+        if self.console is not None:
+            self.display = Progress(
+                TextColumn(f"[bold {color}]{{task.description}}"),
+                BarColumn(bar_width=None, complete_style=color, finished_style=color),
+                TaskProgressColumn(),
+                MofNCompleteColumn(),
+                TextColumn("[dim]Elapsed"),
+                TimeElapsedColumn(),
+                TextColumn("[dim]ETA"),
+                TimeRemainingColumn(),
+                TextColumn("{task.fields[detail]}"),
+                console=self.console, auto_refresh=False, expand=True,
+            )
+            self.task = self.display.add_task(label, total=total, detail="")
+
+    def __enter__(self):
+        if self.interactive:
+            self.display.start()
+        return self
+
+    def __exit__(self, *_):
+        if self.interactive:
+            self.display.stop()
 
     def due(self, step):
         if not self.log_every:
@@ -41,18 +64,9 @@ class BatchProgress:
 
     def update(self, step, detail=""):
         self.last_update = monotonic()
-        fraction = step / self.total if self.total else 1.0
-        filled = int(20 * fraction)
-        bar = "#" * filled + "-" * (20 - filled)
-        elapsed = self.last_update - self.started
-        eta = str(timedelta(seconds=int(elapsed * (self.total - step) / step))) if step else "--"
-        end = "\n"
-        if self.interactive and step < self.total:
-            end = "\r"
-        line = f"{self.label} [{bar}] {step}/{self.total} {fraction:5.1%} ETA {eta}{detail}"
-        if self.interactive:
-            line += "\x1b[K"
-        print(line, file=sys.stderr, end=end, flush=True)
+        self.display.update(self.task, completed=step, detail=detail, refresh=self.interactive)
+        if not self.interactive:
+            self.console.print(self.display.get_renderable())
 
 
 def make_loader(scenes, size, device, batch_size, workers, *,
@@ -73,29 +87,30 @@ def make_loader(scenes, size, device, batch_size, workers, *,
 def train_epoch(model, criterion, optimizer, loader, device, epoch, rank, log_every, *, epochs=None):
     model.train()
     epoch_label = str(epoch) if epochs is None else f"{epoch}/{epochs}"
-    progress = BatchProgress(f"Train {epoch_label}", len(loader), log_every) if rank == 0 else None
+    progress_label = f"Train {epoch_label}" if rank == 0 else None
     fields = ("loss", "loss_cls", "loss_reg", "loss_conf")
     totals = torch.zeros(5, dtype=torch.float32, device=device)
-    for step, (images, targets) in enumerate(loader, 1):
-        padded = pad_targets(
-            [target["labels"] for target in targets],
-            [target["boxes"] for target in targets],
-            [target["visibility"] for target in targets],
-            num_queries=NUM_QUERIES, no_object_index=1,
-        )
-        padded = {k: v.to(device, non_blocking=True) for k, v in padded.items()}
-        optimizer.zero_grad(set_to_none=True)
-        losses = criterion(model(images.to(device, non_blocking=True)), padded)
-        loss = losses["loss"]
-        if not torch.isfinite(loss):
-            ids = ", ".join(f"{t['sequence']}:{t['timestamp']}" for t in targets)
-            raise FloatingPointError(f"non-finite training loss on {ids}")
-        loss.backward()
-        optimizer.step()
-        totals[:4] += torch.stack([losses[field] for field in fields]).detach() * len(targets)
-        totals[4] += len(targets)
-        if progress is not None and progress.due(step):
-            progress.update(step, f" loss={loss.item():.4f}")
+    with BatchProgress(progress_label, len(loader), log_every) as progress:
+        for step, (images, targets) in enumerate(loader, 1):
+            padded = pad_targets(
+                [target["labels"] for target in targets],
+                [target["boxes"] for target in targets],
+                [target["visibility"] for target in targets],
+                num_queries=NUM_QUERIES, no_object_index=1,
+            )
+            padded = {k: v.to(device, non_blocking=True) for k, v in padded.items()}
+            optimizer.zero_grad(set_to_none=True)
+            losses = criterion(model(images.to(device, non_blocking=True)), padded)
+            loss = losses["loss"]
+            if not torch.isfinite(loss):
+                ids = ", ".join(f"{t['sequence']}:{t['timestamp']}" for t in targets)
+                raise FloatingPointError(f"non-finite training loss on {ids}")
+            loss.backward()
+            optimizer.step()
+            totals[:4] += torch.stack([losses[field] for field in fields]).detach() * len(targets)
+            totals[4] += len(targets)
+            if progress.due(step):
+                progress.update(step, f"[yellow]loss {loss.item():.4f}[/yellow]")
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(totals)
     return dict(zip(fields, (totals[:4] / totals[4]).cpu().tolist()))
@@ -108,28 +123,29 @@ def evaluate(model, loader, device, confidence_threshold, iou_threshold, predict
     association = AssociationMetrics(iou_threshold)
     detection = DetectionMetrics()
     frames = 0
-    progress = BatchProgress(progress_label, len(loader), log_every) if progress_label else None
-    for step, (images, targets) in enumerate(loader, 1):
-        outputs = model(images.to(device, non_blocking=True))
-        for (boxes, scores, present), target in zip(decode(outputs, confidence_threshold), targets):
-            association.update(boxes, present, target)
-            detection.update(boxes, scores, target)
-            frames += 1
-            if predictions is not None:
-                detections = []
-                for view, (width, height) in enumerate(target["sizes"]):
-                    scale = boxes.new_tensor([width, height, width, height])
-                    detections.append([
-                        {"id": query, "xyxy": (boxes[view, query] * scale).tolist(),
-                         "score": scores[view, query].item()}
-                        for query in present[view].nonzero().flatten().tolist()
-                    ])
-                predictions.write(json.dumps({
-                    "sequence": target["sequence"], "timestamp": target["timestamp"],
-                    "views": detections,
-                }) + "\n")
-        if progress is not None and progress.due(step):
-            progress.update(step)
+    total_steps = len(loader) if progress_label else 0
+    with BatchProgress(progress_label, total_steps, log_every, color="green") as progress:
+        for step, (images, targets) in enumerate(loader, 1):
+            outputs = model(images.to(device, non_blocking=True))
+            for (boxes, scores, present), target in zip(decode(outputs, confidence_threshold), targets):
+                association.update(boxes, present, target)
+                detection.update(boxes, scores, target)
+                frames += 1
+                if predictions is not None:
+                    detections = []
+                    for view, (width, height) in enumerate(target["sizes"]):
+                        scale = boxes.new_tensor([width, height, width, height])
+                        detections.append([
+                            {"id": query, "xyxy": (boxes[view, query] * scale).tolist(),
+                             "score": scores[view, query].item()}
+                            for query in present[view].nonzero().flatten().tolist()
+                        ])
+                    predictions.write(json.dumps({
+                        "sequence": target["sequence"], "timestamp": target["timestamp"],
+                        "views": detections,
+                    }) + "\n")
+            if progress.due(step):
+                progress.update(step)
     return {"frames": frames, **association.compute(), **detection.compute()}
 
 
