@@ -33,7 +33,7 @@ def json_file(path, payload):
 
 
 def loader(pairs, cfg, batch, workers, device, training=False, rank=0, world=1):
-    dataset = CrossDrone(pairs, cfg["size"], augment=training and not cfg["overfit"])
+    dataset = CrossDrone(pairs, cfg["size"], augment=training and not cfg["overfit"] and not cfg.get("no_augmentation", False))
     sampler = DistributedSampler(dataset, num_replicas=world, rank=rank, seed=cfg["seed"]) if training and world > 1 else None
     return DataLoader(dataset, batch_size=batch, shuffle=training and sampler is None, sampler=sampler,
                       num_workers=workers, collate_fn=collate, pin_memory=device.type == "cuda",
@@ -51,9 +51,9 @@ def selected(data, cfg, split, limit=None, full=False):
 
 
 @torch.inference_mode()
-def assess(net, batches, device, cfg, label, output=None):
+def assess(net, batches, device, cfg, label, output=None, *, diagnostics=False):
     net.eval()
-    meter = Evaluation(cfg["confidence_threshold"], cfg["association_iou"])
+    meter = Evaluation(cfg["confidence_threshold"], cfg["association_iou"], diagnostics=diagnostics)
     with (output.open("w", encoding="utf-8") if output else nullcontext()) as stream:
         for images, targets in track(batches, description=label):
             views = {k: v.float().cpu() for k,v in net(images.to(device)).items()}
@@ -82,6 +82,8 @@ def train(args, device, rank, world):
                association_iou=args.association_iou, batch_size=args.batch_size, world_size=world,
                lr=args.lr, weight_decay=args.weight_decay, pretrained=not args.random_init,
                workers=args.workers)
+    if args.no_augmentation:
+        cfg["no_augmentation"] = True
     last = args.output / "last.pt"
     checkpoint = torch.load(last, map_location="cpu", weights_only=True) if args.resume else None
     if checkpoint is not None and checkpoint["config"] != cfg:
@@ -164,16 +166,26 @@ def evaluate(args, device):
     save = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     cfg = save["config"]
     data, _, fingerprint = index_data(args.data, cfg["splits"])
-    batches = loader(selected(data, cfg, args.split, args.limit, args.full), cfg,
-                     args.batch_size, args.workers, device)
     model = AssociationNetwork(Architecture(**cfg["architecture"]))
     model.load_state_dict(save["model"])
+    epoch = save["epoch"]
+    del save
+    model.to(device)
     if args.predictions:
         args.predictions.parent.mkdir(parents=True, exist_ok=True)
-    report = assess(model.to(device), batches, device, cfg, f"Evaluate {args.split}", args.predictions)
-    report.update(checkpoint_epoch=save["epoch"], split=args.split,
-                  data_changed=fingerprint != cfg["fingerprint"],
-                  same_image_validation=cfg["overfit"] and args.split == "val")
+
+    def evaluate_split(split):
+        batches = loader(selected(data, cfg, split, args.limit, args.full), cfg,
+                         args.batch_size, args.workers, device)
+        result = assess(model, batches, device, cfg, f"Evaluate {split}", args.predictions,
+                        diagnostics=args.diagnostics)
+        result.update(checkpoint_epoch=epoch, split=split,
+                      data_changed=fingerprint != cfg["fingerprint"],
+                      same_image_validation=cfg["overfit"] and split == "val")
+        return result
+
+    report = ({split: evaluate_split(split) for split in ("train", "val")}
+              if args.split == "train-val" else evaluate_split(args.split))
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         json_file(args.output, report)
@@ -205,6 +217,7 @@ def main():
     fit.add_argument("--baseline", action="store_true")
     fit.add_argument("--resume", action="store_true")
     fit.add_argument("--overfit", action="store_true")
+    fit.add_argument("--no-augmentation", action="store_true", help="keep an independent validation split")
     fit.add_argument("--limit-train", type=int)
     fit.add_argument("--limit-val", type=int)
     fit.add_argument("--confidence-threshold", type=float, default=.5)
@@ -212,12 +225,13 @@ def main():
     for field, default in (("box",1.), ("reg",1.), ("conf",1.), ("l1",5.), ("giou",2.)):
         fit.add_argument(f"--lambda-{field}", type=float, default=default)
     infer.add_argument("checkpoint", type=Path)
-    infer.add_argument("--split", choices=tuple(SPLITS), default="test")
+    infer.add_argument("--split", choices=(*SPLITS, "train-val"), default="test")
     selection = infer.add_mutually_exclusive_group()
     selection.add_argument("--limit", type=int)
     selection.add_argument("--full", action="store_true")
     infer.add_argument("--output", type=Path)
     infer.add_argument("--predictions", type=Path)
+    infer.add_argument("--diagnostics", action="store_true")
     args = parser.parse_args()
     if args.command == "audit":
         _, counts, fingerprint = index_data(args.data, {s: getattr(args, f"{s}_sequences") for s in SPLITS})
@@ -243,6 +257,8 @@ def main():
     else:
         if args.limit is not None and args.limit < 1:
             parser.error("Limits must be positive")
+        if args.split == "train-val" and args.predictions:
+            parser.error("--predictions requires a single split")
         paths = [p.resolve() for p in (args.checkpoint, args.output, args.predictions) if p]
         if len(set(paths)) != len(paths):
             parser.error("Checkpoint, metrics and predictions require distinct paths")

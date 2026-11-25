@@ -36,3 +36,14 @@ CUDA_VISIBLE_DEVICES=2 python -m paper_reproduction evaluate runs/paper-fit8/las
 确认同图拟合后，去掉 `--overfit --limit-train 8`，并使用新的输出目录来跑独立验证。默认使用预训练权重，优先读取仓库根目录的 `weights/resnet50-11ad3fa6.pth` 或 `weights/vit_b_16-c867db91.pth`。也可显式传入 `--weights PATH` 或选择 `--random-init`。使用 `--backbone vit_b_16` 切换骨干。续训保留原训练参数和目录并加 `--resume`，用 `--epochs` 指定新的总轮数。
 
 本目录的实验外围覆盖 Cross-Drone。论文的其他数据集、第三方方法和实飞实验需要各自的输入数据与评估适配。表 I 的指标还需实际训练验证。
+
+### 训练集覆盖率也为零时
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python -m paper_reproduction evaluate \
+  runs/paper-cross-sequence-check/last.pt --data crossdrone-data --device cuda \
+  --split train-val --diagnostics --batch-size 2 \
+  --output runs/paper-cross-sequence-check/localization-epoch12.json
+```
+
+报告沿用 checkpoint 保存的取样限额，按集合及序列记录最佳 IoU、中心误差和预测框与标注框的宽高比。中心修正上限保留预测框尺寸，宽高修正上限保留预测框中心，两者均忽略分数。若要对照增强效果，可用同一套训练参数从同一初始化新增 `--no-augmentation`，并换输出目录。验证仍用原来的独立序列。
