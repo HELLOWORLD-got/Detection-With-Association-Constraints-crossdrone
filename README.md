@@ -156,3 +156,16 @@ CUDA_VISIBLE_DEVICES=2,3 NCCL_P2P_DISABLE=1 bash train_crossdrone.sh \
 ```
 
 和既有 `position-key` 的同轮结果对比原始 IoU、IoU≥0.5 覆盖率和 AP50。确认定位能改善后，再用评估报告检查车辆概率和可见性过滤。
+
+### 一次性诊断已有权重
+
+```bash
+CUDA_VISIBLE_DEVICES=2 python -u diagnose_crossdrone.py --device cuda
+```
+
+默认比较 `position-key`、`content-key` 和宽高先验三组 8 对图像实验的 `best.pt` 与 `last.pt`。也可在命令后直接列出其他实验目录。脚本沿用各 checkpoint 的模型、样本限额和阈值。同图实验只评估一次训练子集，普通实验评估训练子集和独立验证集。默认报告放在 `runs/diagnosis-日期-时间/`。
+
+- `summary.md` 给出各权重、训练历史和定位/置信度瓶颈的对照表。
+- `summary.json` 包含两种坐标上限检查、分数过滤统计、宽高和中心误差、梯度和逐权重指标。各 checkpoint 另有逐帧 JSON、通过阈值的预测 JSONL 及日志。
+- 中心替换上限把候选框中心临时设为 GT 中心，保留宽高。宽高替换上限反过来做。两项均忽略置信度，可帮助判断误差来源。同查询覆盖统计单个查询在两个视图都达到 IoU 0.5 的共同可见实例数。这些量供诊断使用，正式结果仍以 AP、MDA、UCR 为准。
+- 缺失权重、失败的评估和数据索引变化会列在报告里，其余权重继续评估。

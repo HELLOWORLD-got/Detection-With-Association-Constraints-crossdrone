@@ -206,7 +206,7 @@ def run(args, data, audit, splits, world_size, rank, device):
         net, device_ids=[device.index] if device.type == "cuda" else None
     ) if world_size > 1 else net
     def validate(label):
-        diagnostics = Diagnostics(args.confidence_threshold) if args.overfit else None
+        diagnostics = Diagnostics(args.confidence_threshold, detailed=False) if args.overfit else None
         result = evaluate(
             net, val_loader, device, args.confidence_threshold, args.association_iou,
             progress_label=label, log_every=args.log_every, diagnostics=diagnostics,

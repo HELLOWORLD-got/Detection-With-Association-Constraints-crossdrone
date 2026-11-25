@@ -79,6 +79,27 @@ class RegressionTests(unittest.TestCase):
         settings["overfit"] = True
         self.assertEqual(evaluation_scenes(data, settings, "val"), small[:2])
 
+    def test_diagnostic_distinguishes_centers_and_disjoint_score_gates(self):
+        truth = torch.tensor([[[.4, .4, .1, .1], [.7, .7, .1, .1]]] * 2)
+        predictions = torch.tensor([[[.4, .4, .1, .1], [.4, .4, .1, .1],
+                                     [.9, .9, .1, .1]]] * 2)
+        outputs = {
+            "boxes": predictions[None],
+            "class_logits": torch.tensor([[[10., -10.], [-10., 10.], [10., -10.]]]),
+            "confidences": torch.tensor([[[.1, .9, .9], [.1, .9, .9]]]),
+        }
+        target = {"boxes": truth, "visibility": torch.ones(2, 2, dtype=torch.bool),
+                  "sequence": "1", "timestamp": "0", "sizes": [(100, 100)] * 2}
+        diagnostics = Diagnostics()
+        diagnostics.update(outputs, [target])
+        result = diagnostics.compute()["summary"]
+        self.assertEqual(result["oracle_center_fixed_coverage_iou50"], 1.)
+        self.assertEqual(result["oracle_size_fixed_coverage_iou50"], .5)
+        self.assertEqual(result["coverage_failure_counts"]["disjoint_candidates"], 2)
+        self.assertEqual(result["coverage_failure_counts"]["localization"], 2)
+        self.assertEqual(result["kept_oracle_coverage_iou50"], 0.)
+        self.assertEqual(result["raw_same_query_iou50"], {"covered": 1, "shared_targets": 2})
+
     def test_diagnostic_separates_localization_from_filtering(self):
         truth = torch.tensor([[[.5, .5, .1, .1]]]*2)
         outputs = {"boxes": truth[None], "class_logits": torch.tensor([[[20., -20.]]]),
