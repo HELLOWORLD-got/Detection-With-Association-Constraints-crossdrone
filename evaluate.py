@@ -44,7 +44,8 @@ def main():
         evaluation_scenes(data, settings, args.split, args.limit, args.full),
         settings["size"], device, args.batch_size, args.workers
     )
-    net = build_model(ModelConfig(**{**settings["model"], "pretrained": False}))
+    model_settings = {"mvoq_share_attention": True, **settings["model"], "pretrained": False}
+    net = build_model(ModelConfig(**model_settings))
     net.load_state_dict(checkpoint["model"])
     epoch = checkpoint["epoch"]
     del checkpoint
@@ -60,7 +61,8 @@ def main():
                           progress_label=f"Eval {args.split}", diagnostics=diagnostics)
     if diagnostics is not None:
         result["diagnostics"] = diagnostics.compute()
-    result = {"checkpoint_epoch": epoch, "overfit_run": settings.get("overfit", False), "split": args.split, "dataset_index_changed": dataset_changed, **result}
+    result = {"checkpoint_epoch": epoch, "overfit_run": settings.get("overfit", False),
+              "mvoq_attention_shared": model_settings["mvoq_share_attention"], "split": args.split, "dataset_index_changed": dataset_changed, **result}
     if args.output:
         write_json(args.output, result)
     print(json.dumps(result, indent=2))

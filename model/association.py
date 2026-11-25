@@ -63,6 +63,7 @@ class ConflictFreeMultiViewAssociation(nn.Module):
             num_views=config.num_views,
             num_queries=config.num_queries,
             num_layers=config.mvoq_layers,
+            share_attention=config.mvoq_share_attention,
             ffn_ratio=config.ffn_ratio,
             dropout=config.dropout,
         )

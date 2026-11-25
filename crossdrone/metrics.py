@@ -75,7 +75,9 @@ class AssociationMetrics:
             recall.append(ta / truth if truth else 0.0)
             f1.append(2 * ta / (predicted + truth) if predicted + truth else 0.0)
         return {
-            "MDA": self.mda_sum / max(1, self.nonempty),
+            # Eq. (26) averages over every frame and device pair. The paper
+            # leaves a zero denominator undefined; those terms contribute zero.
+            "MDA": self.mda_sum / max(1, self.nonempty + self.empty),
             "UCR": self.correct / max(1, self.total),
             "association_precision": sum(precision) / max(1, len(precision)),
             "association_recall": sum(recall) / max(1, len(recall)),

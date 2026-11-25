@@ -112,6 +112,11 @@ def run(args, data, audit, splits, world_size, rank, device):
     }
     if args.overfit:
         settings["overfit"] = True
+    if checkpoint is not None and checkpoint["settings"]["model"].get("mvoq_share_attention", True):
+        raise ValueError(
+            "This checkpoint uses shared MVOQ attention. Use evaluate.py to inspect it, "
+            "or choose a new --output and train the per-view architecture from initialization."
+        )
     if checkpoint is not None and checkpoint["settings"] != settings:
         raise ValueError("resume settings or indexed data differ from the saved run")
     if checkpoint is not None and checkpoint["epoch"] >= args.epochs:

@@ -6,13 +6,38 @@ import torch
 from torch import nn
 
 from crossdrone.diagnostics import Diagnostics, evaluation_scenes
-from model import build_model, ModelConfig, pad_targets
+from crossdrone.metrics import AssociationMetrics
+from model import build_model, ModelConfig, pad_targets, box_xywh_to_xyxy
+from model.mvoq import MultiViewObjectQuery
 from model.loss import SetCriterion
 from model.matcher import HungarianMatcher, _hungarian_numpy
 from model.box_ops import box_loss
 
 
 class RegressionTests(unittest.TestCase):
+    def test_mvoq_attention_is_independent_per_view(self):
+        torch.manual_seed(5)
+        model = MultiViewObjectQuery(dim=32, num_heads=4, num_views=2, num_queries=3,
+                                     num_layers=1, dropout=0).eval()
+        instances = torch.randn(1, 3, 32)
+        views = [torch.randn(1, 32, 2, 3) for _ in range(2)]
+        with torch.no_grad():
+            before = model(instances, views)["boxes"]
+            model.view_layers[0][0].output_projection.bias[0] += 2.0
+            after = model(instances, views)["boxes"]
+        self.assertFalse(torch.allclose(before[:, 0], after[:, 0]))
+        torch.testing.assert_close(before[:, 1], after[:, 1])
+
+    def test_mda_averages_all_frame_view_pairs(self):
+        metric = AssociationMetrics()
+        truth = torch.tensor([[[.5, .5, .2, .2]]] * 2)
+        boxes = box_xywh_to_xyxy(truth)
+        present = torch.ones(2, 1, dtype=torch.bool)
+        metric.update(boxes, present, {"boxes": truth, "visibility": present})
+        metric.update(boxes, ~present, {"boxes": truth[:, :0], "visibility": present[:, :0]})
+        self.assertEqual(metric.compute()["MDA"], .5)
+        self.assertEqual(metric.compute()["empty_association_pairs"], 1)
+
     def test_wrong_saturated_confidence_keeps_gradient(self):
         logits = torch.tensor([[[-25., 25.]]], requires_grad=True)
         boxes = torch.tensor([[[[.5, .5, .2, .2], [0., 0., 0., 0.]]]])

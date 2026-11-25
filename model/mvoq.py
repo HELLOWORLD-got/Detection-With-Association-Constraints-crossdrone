@@ -92,6 +92,7 @@ class MultiViewObjectQuery(nn.Module):
         num_layers: int = 2,
         ffn_ratio: int = 4,
         dropout: float = 0.1,
+        share_attention: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -102,10 +103,19 @@ class MultiViewObjectQuery(nn.Module):
         self.object_queries = nn.Parameter(
             torch.randn(num_views, num_queries, dim) * 0.02
         )
-        # Layer weights are shared across views ("CA Blocks" repeated in Fig. 3).
-        self.layers = nn.ModuleList(
-            [TripletAttentionBlock(dim, num_heads, ffn_ratio, dropout) for _ in range(num_layers)]
-        )
+        def attention_stack():
+            return nn.ModuleList(
+                TripletAttentionBlock(dim, num_heads, ffn_ratio, dropout)
+                for _ in range(num_layers)
+            )
+
+        self.share_attention = share_attention
+        if share_attention:
+            # Preserve the original parameter names for legacy checkpoint evaluation.
+            self.layers = attention_stack()
+        else:
+            # Fig. 3 puts the CA stack inside each view's regression branch.
+            self.view_layers = nn.ModuleList(attention_stack() for _ in range(num_views))
 
         # Eq. (12): box head per view, Sigmoid to keep the box in [0, 1]^4.
         # Fig. 3 labels them "View 1 Reg Head" ... "View n Reg Head", and the
@@ -159,7 +169,8 @@ class MultiViewObjectQuery(nn.Module):
             view = single_view_features[k]
             view_tokens = view.flatten(2).transpose(1, 2)
             queries = self.object_queries[k].unsqueeze(0).expand(batch, -1, -1)
-            for layer in self.layers:
+            layers = self.layers if self.share_attention else self.view_layers[k]
+            for layer in layers:
                 queries = layer(queries, instance_features, view_tokens, view.shape[-2:])
             per_view.append(queries)
 

@@ -32,6 +32,7 @@ class ModelConfig:
     giq_layers: int = 3
     # MVOQ
     mvoq_layers: int = 2
+    mvoq_share_attention: bool = False  # True only for checkpoints predating the Fig. 3 alignment.
     # matching / loss, Eq. (20)-(25)
     cost_class: float = 1.0
     cost_bbox: float = 1.0
