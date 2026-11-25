@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import random
+import sys
 
 import torch
 import torch.distributed as dist
@@ -17,6 +18,10 @@ from torch.nn.parallel import DistributedDataParallel
 from crossdrone.data import NUM_QUERIES, NUM_VIEWS, SPLITS, index_dataset
 from crossdrone.engine import evaluate, make_loader, resolve_device, save_checkpoint, train_epoch, write_json
 from model import ModelConfig, TrainConfig, build_model
+
+
+def report_startup(message):
+    print(f"[Startup] {message}", file=sys.stderr, flush=True)
 
 
 def parse_args():
@@ -109,12 +114,20 @@ def run(args, data, audit, splits, world_size, rank, device):
         audit["training_eligible"] = audit["splits"]["train"]["complete"] - audit["splits"]["train"]["over_capacity"]
         audit["training_used"] = len(loader.dataset)
         audit["validation_used"] = len(val_loader.dataset)
+        report_startup(
+            f"Data ready: {len(loader.dataset)} training pairs, {len(val_loader.dataset)} validation pairs"
+        )
         write_json(output / "data_audit.json", audit)
         write_json(output / "config.json", {**settings, "epochs": args.epochs})
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     initialization = replace(model_config, pretrained=model_config.pretrained and checkpoint is None and rank == 0)
+    if rank == 0:
+        source = str(last_path) if checkpoint is not None else (
+            "ImageNet pretrained weights" if initialization.pretrained else "random initialization"
+        )
+        report_startup(f"Building {model_config.backbone} on {device} using {source}")
     net = build_model(initialization).to(device)
     criterion = net.build_criterion()
     optimizer = torch.optim.AdamW(
@@ -130,9 +143,13 @@ def run(args, data, audit, splits, world_size, rank, device):
         best = tuple(checkpoint["best"])
         history = checkpoint["history"]
         del checkpoint
+    if rank == 0 and world_size > 1:
+        report_startup(f"Synchronizing model across {world_size} processes")
     model = DistributedDataParallel(
         net, device_ids=[device.index] if device.type == "cuda" else None
     ) if world_size > 1 else net
+    if rank == 0:
+        report_startup(f"Starting epoch {start_epoch}/{args.epochs} and loading its first batch")
 
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_seed = args.seed + epoch * world_size + rank
@@ -168,14 +185,18 @@ def run(args, data, audit, splits, world_size, rank, device):
 
 def main():
     args = parse_args()
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
     splits = {split: getattr(args, f"{split}_sequences") for split in SPLITS}
+    if rank == 0 and not args.audit_only:
+        report_startup(f"Indexing XML annotations and image pairs in {args.data.resolve()}")
     data, audit = index_dataset(args.data, splits)
     if args.audit_only:
         print(json.dumps(audit, indent=2, ensure_ascii=False))
         return
 
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0 and world_size > 1:
+        report_startup(f"Initializing the distributed process group ({world_size} processes)")
     device = setup_device(args.device, world_size)
     try:
         run(args, data, audit, splits, world_size, rank, device)
