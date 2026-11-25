@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 import json
 from pathlib import Path
+import sys
+from time import monotonic
 
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
@@ -12,6 +15,44 @@ from model import pad_targets
 
 from .data import NUM_QUERIES, CrossDroneDataset, collate
 from .metrics import AssociationMetrics, DetectionMetrics, decode
+
+
+class BatchProgress:
+    """Update a terminal line or emit periodic lines to redirected logs."""
+
+    def __init__(self, label, total, log_every):
+        self.label = label
+        self.total = total
+        self.log_every = log_every
+        self.interactive = sys.stderr.isatty()
+        self.started = monotonic()
+        self.last_update = self.started
+        if self.interactive and self.log_every:
+            self.update(0)
+
+    def due(self, step):
+        if not self.log_every:
+            return False
+        if step == self.total:
+            return True
+        if self.interactive:
+            return monotonic() - self.last_update >= 0.25
+        return step % self.log_every == 0
+
+    def update(self, step, detail=""):
+        self.last_update = monotonic()
+        fraction = step / self.total if self.total else 1.0
+        filled = int(20 * fraction)
+        bar = "#" * filled + "-" * (20 - filled)
+        elapsed = self.last_update - self.started
+        eta = str(timedelta(seconds=int(elapsed * (self.total - step) / step))) if step else "--"
+        end = "\n"
+        if self.interactive and step < self.total:
+            end = "\r"
+        line = f"{self.label} [{bar}] {step}/{self.total} {fraction:5.1%} ETA {eta}{detail}"
+        if self.interactive:
+            line += "\x1b[K"
+        print(line, file=sys.stderr, end=end, flush=True)
 
 
 def make_loader(scenes, size, device, batch_size, workers, *,
@@ -29,8 +70,10 @@ def make_loader(scenes, size, device, batch_size, workers, *,
     )
 
 
-def train_epoch(model, criterion, optimizer, loader, device, epoch, rank, log_every):
+def train_epoch(model, criterion, optimizer, loader, device, epoch, rank, log_every, *, epochs=None):
     model.train()
+    epoch_label = str(epoch) if epochs is None else f"{epoch}/{epochs}"
+    progress = BatchProgress(f"Train {epoch_label}", len(loader), log_every) if rank == 0 else None
     fields = ("loss", "loss_cls", "loss_reg", "loss_conf")
     totals = torch.zeros(5, dtype=torch.float32, device=device)
     for step, (images, targets) in enumerate(loader, 1):
@@ -51,20 +94,22 @@ def train_epoch(model, criterion, optimizer, loader, device, epoch, rank, log_ev
         optimizer.step()
         totals[:4] += torch.stack([losses[field] for field in fields]).detach() * len(targets)
         totals[4] += len(targets)
-        if rank == 0 and log_every and (step % log_every == 0 or step == len(loader)):
-            print(f"epoch {epoch} step {step}/{len(loader)} loss={loss.item():.4f}", flush=True)
+        if progress is not None and progress.due(step):
+            progress.update(step, f" loss={loss.item():.4f}")
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(totals)
     return dict(zip(fields, (totals[:4] / totals[4]).cpu().tolist()))
 
 
 @torch.inference_mode()
-def evaluate(model, loader, device, confidence_threshold, iou_threshold, predictions=None):
+def evaluate(model, loader, device, confidence_threshold, iou_threshold, predictions=None, *,
+             progress_label=None, log_every=50):
     model.eval()
     association = AssociationMetrics(iou_threshold)
     detection = DetectionMetrics()
     frames = 0
-    for images, targets in loader:
+    progress = BatchProgress(progress_label, len(loader), log_every) if progress_label else None
+    for step, (images, targets) in enumerate(loader, 1):
         outputs = model(images.to(device, non_blocking=True))
         for (boxes, scores, present), target in zip(decode(outputs, confidence_threshold), targets):
             association.update(boxes, present, target)
@@ -83,6 +128,8 @@ def evaluate(model, loader, device, confidence_threshold, iou_threshold, predict
                     "sequence": target["sequence"], "timestamp": target["timestamp"],
                     "views": detections,
                 }) + "\n")
+        if progress is not None and progress.due(step):
+            progress.update(step)
     return {"frames": frames, **association.compute(), **detection.compute()}
 
 

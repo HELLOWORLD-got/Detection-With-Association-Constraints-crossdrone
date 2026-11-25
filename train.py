@@ -37,7 +37,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--confidence-threshold", type=float, default=0.5)
     parser.add_argument("--association-iou", type=float, default=0.5)
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--log-every", type=int, default=50,
+                        help="progress interval in redirected logs (0 disables progress)")
     parser.add_argument("--resume", action="store_true", help="resume from OUTPUT/last.pt")
     parser.add_argument("--audit-only", action="store_true", help="report XML and split coverage")
     parser.add_argument("--random-init", action="store_true", help="initialize without ImageNet weights")
@@ -139,9 +140,14 @@ def run(args, data, audit, splits, world_size, rank, device):
         torch.manual_seed(epoch_seed)
         if isinstance(loader.sampler, torch.utils.data.DistributedSampler):
             loader.sampler.set_epoch(epoch)
-        losses = train_epoch(model, criterion, optimizer, loader, device, epoch, rank, args.log_every)
+        losses = train_epoch(
+            model, criterion, optimizer, loader, device, epoch, rank, args.log_every, epochs=args.epochs
+        )
         if rank == 0:
-            validation = evaluate(net, val_loader, device, args.confidence_threshold, args.association_iou)
+            validation = evaluate(
+                net, val_loader, device, args.confidence_threshold, args.association_iou,
+                progress_label=f"Val {epoch}/{args.epochs}", log_every=args.log_every,
+            )
             record = {"epoch": epoch, "train": losses, "val": validation}
             history.append(record)
             score = (validation["MDA"], validation["mAP"] or 0.0)
