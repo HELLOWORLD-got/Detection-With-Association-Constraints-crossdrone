@@ -1,8 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from .network import Architecture, TripletBlock, position_grid
+from .network import Architecture, AssociationNetwork, TripletBlock, position_grid
 from .objective import LossWeights, objective
 from .scoring import Evaluation
 
@@ -23,6 +24,23 @@ class PaperEquations(unittest.TestCase):
         hidden = block.norm_attention(slots + block.readout(context))
         expected = block.norm_ff(hidden + block.ff(hidden))
         torch.testing.assert_close(block(slots, instances, tokens, positions), expected)
+
+    def test_learned_key_starts_at_fixed_key_and_gets_training_signal(self):
+        shape = dict(width=16, heads=4, queries=3, fusion_depth=1, instance_depth=1, object_depth=1)
+        with patch("paper_reproduction.network.ImageEncoder",
+                   side_effect=lambda cfg, *_: torch.nn.Conv2d(3, cfg.width, 2, stride=2)):
+            torch.manual_seed(27)
+            fixed = AssociationNetwork(Architecture(**shape))
+            torch.manual_seed(27)
+            learned = AssociationNetwork(Architecture(**shape, learned_key=True))
+        images = torch.randn(2, 2, 3, 6, 10)
+        baseline, candidate = fixed(images), learned(images)
+        for label in baseline:
+            torch.testing.assert_close(baseline[label], candidate[label], atol=0, rtol=0)
+        candidate["box"].sum().backward()
+        for view in learned.views:
+            grad = view.blocks[0].key_gate.net[-1].weight.grad
+            self.assertTrue(grad.isfinite().all() and grad.abs().sum() > 0)
 
     def test_equations_20_to_28_on_permuted_slots_with_invisible_view(self):
         boxes = torch.tensor([

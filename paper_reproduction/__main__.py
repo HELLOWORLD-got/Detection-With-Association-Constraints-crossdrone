@@ -13,7 +13,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from rich.progress import track
 
-from .dataset import CrossDrone, collate, index_data
+from .dataset import CrossDrone, collate, index_data, median_visible_sizes
 from .network import Architecture, AssociationNetwork
 from .objective import LossWeights, objective
 from .scoring import Evaluation
@@ -70,13 +70,17 @@ def seed(value):
 
 
 def train(args, device, rank, world):
-    architecture = Architecture(backbone=args.backbone)
+    architecture = Architecture(backbone=args.backbone, learned_key=args.mvoq_learned_key)
+    architecture_settings = asdict(architecture)
+    if not architecture.learned_key:
+        # Keep older fixed-Key training checkpoints compatible for resume.
+        architecture_settings.pop("learned_key")
     weights = LossWeights(match_box=args.lambda_box, regression=args.lambda_reg, confidence=args.lambda_conf,
                           l1=args.lambda_l1, giou=args.lambda_giou)
     splits = {s: getattr(args, f"{s}_sequences") for s in SPLITS}
     print(f"[rank {rank}] Indexing {args.data}", flush=True)
     data, audit, fingerprint = index_data(args.data, splits)
-    cfg = dict(architecture=asdict(architecture), loss=asdict(weights), splits=splits, fingerprint=fingerprint,
+    cfg = dict(architecture=architecture_settings, loss=asdict(weights), splits=splits, fingerprint=fingerprint,
                size=args.size, seed=args.seed, overfit=args.overfit, limit_train=args.limit_train,
                limit_val=args.limit_val, confidence_threshold=args.confidence_threshold,
                association_iou=args.association_iou, batch_size=args.batch_size, world_size=world,
@@ -84,6 +88,9 @@ def train(args, device, rank, world):
                workers=args.workers)
     if args.no_augmentation:
         cfg["no_augmentation"] = True
+    train_pairs = selected(data, cfg, "train")
+    if args.box_size_prior:
+        cfg["box_size_prior"] = median_visible_sizes(train_pairs)
     last = args.output / "last.pt"
     checkpoint = torch.load(last, map_location="cpu", weights_only=True) if args.resume else None
     if checkpoint is not None and checkpoint["config"] != cfg:
@@ -93,7 +100,6 @@ def train(args, device, rank, world):
     start = checkpoint["epoch"] + 1 if checkpoint else 1
     if start > args.epochs:
         raise ValueError("Requested epochs are already complete")
-    train_pairs = selected(data, cfg, "train")
     batches = loader(train_pairs, cfg, args.batch_size // world, args.workers, device, True, rank, world)
     if rank == 0:
         validation = loader(selected(data, cfg, "val"), cfg, args.batch_size // world, args.workers, device)
@@ -111,6 +117,10 @@ def train(args, device, rank, world):
     initialize = checkpoint is None and rank == 0 and not args.random_init
     net = AssociationNetwork(architecture, pretrained=initialize,
                              weights_file=local_weights if initialize else None).to(device)
+    if checkpoint is None and "box_size_prior" in cfg:
+        net.initialize_box_size(cfg["box_size_prior"])
+        if rank == 0:
+            print(f"[startup] Normalized width/height priors: {cfg['box_size_prior']}", flush=True)
     optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     history, best = [], (-1., -1.)
     if checkpoint:
@@ -181,6 +191,7 @@ def evaluate(args, device):
                         diagnostics=args.diagnostics)
         result.update(checkpoint_epoch=epoch, split=split,
                       data_changed=fingerprint != cfg["fingerprint"],
+                      mvoq_learned_key=model.cfg.learned_key,
                       same_image_validation=cfg["overfit"] and split == "val")
         return result
 
@@ -217,6 +228,8 @@ def main():
     fit.add_argument("--baseline", action="store_true")
     fit.add_argument("--resume", action="store_true")
     fit.add_argument("--overfit", action="store_true")
+    fit.add_argument("--mvoq-learned-key", action="store_true", help="learn instance-conditioned spatial Key multipliers")
+    fit.add_argument("--box-size-prior", action="store_true", help="initialize box head width/height from training medians")
     fit.add_argument("--no-augmentation", action="store_true", help="keep an independent validation split")
     fit.add_argument("--limit-train", type=int)
     fit.add_argument("--limit-val", type=int)

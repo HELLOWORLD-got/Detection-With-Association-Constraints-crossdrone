@@ -47,3 +47,23 @@ CUDA_VISIBLE_DEVICES=2 python -m paper_reproduction evaluate \
 ```
 
 报告沿用 checkpoint 保存的取样限额，按集合及序列记录最佳 IoU、中心误差和预测框与标注框的宽高比。中心修正上限保留预测框尺寸，宽高修正上限保留预测框中心，两者均忽略分数。若要对照增强效果，可用同一套训练参数从同一初始化新增 `--no-augmentation`，并换输出目录。验证仍用原来的独立序列。
+
+### 宽高初始化对照
+
+`--box-size-prior` 只把每个视图回归头的宽高 bias 初始化为训练子集可见框宽高的中位数，经 logit 转换后写入。使用增强前的训练标注，不读取验证标注。开关默认关闭，已有 checkpoint 仍可直接评估。启用时需要从新目录训练，续训时传入相同开关。用同样的样本上限、增强和轮数与原实验比较。
+
+### MVOQ 可学习空间 Key 对照
+
+`--mvoq-learned-key` 让每个视图的每个 MVOQ CA 块用小型 MLP 从实例向量预测一张空间调制图。默认特征网格为 18×32，其他网格用双线性插值。位置 `t` 的 Key 输入为 `f_i ⊙ p_t × (1 + tanh(MLP(f_i)_t))`，每个 Key 对应原图特征图中的一个 Value。MLP 输出层从零初始化，因此初始输出与固定 Key 一致。该开关只用于对照式 (11) 未公开的空间展开方式。
+
+沿用原来的 384/128 样本、种子和训练配置，从新目录运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 NCCL_P2P_DISABLE=1 \
+  python -u -m torch.distributed.run --standalone --nproc-per-node=2 \
+  --module paper_reproduction train --device cuda --data crossdrone-data \
+  --limit-train 384 --limit-val 128 --baseline --epochs 12 \
+  --mvoq-learned-key --output runs/paper-cross-sequence-learned-key
+```
+
+`evaluate` 从 checkpoint 自动读取 Key 选项。续训也使用同一个 `--mvoq-learned-key` 开关。

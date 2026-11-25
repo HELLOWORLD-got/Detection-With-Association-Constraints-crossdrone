@@ -87,6 +87,20 @@ def index_data(root, splits, capacity=25):
     return data, audit, digest.hexdigest()
 
 
+def median_visible_sizes(pairs):
+    if not pairs:
+        raise ValueError("Cannot initialize box sizes from an empty training subset")
+    boxes = torch.cat([pair.boxes for pair in pairs], dim=1)
+    sizes = boxes[..., 2:] - boxes[..., :2]
+    medians = []
+    for view, view_sizes in enumerate(sizes, 1):
+        visible = view_sizes[(view_sizes > 0).all(-1)]
+        if not len(visible):
+            raise ValueError(f"No visible training boxes for view {view}")
+        medians.append(visible.quantile(.5, dim=0).tolist())
+    return medians
+
+
 class CrossDrone(Dataset):
     def __init__(self, pairs, resolution, augment=False):
         if not pairs:

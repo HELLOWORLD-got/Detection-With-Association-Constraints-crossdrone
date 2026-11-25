@@ -18,6 +18,7 @@ class Architecture:
     instance_depth: int = 3
     object_depth: int = 2
     backbone: str = "resnet50"
+    learned_key: bool = False
 
 
 def position_grid(height, width, channels, reference):
@@ -119,6 +120,26 @@ class InstanceQueries(nn.Module):
         return instances, self.classifier(instances)
 
 
+class SpatialKeyGate(nn.Module):
+    """Predict one instance-specific multiplier for every spatial Key."""
+    grid_size = (18, 32)
+
+    def __init__(self, width):
+        super().__init__()
+        height, columns = self.grid_size
+        self.net = mlp(width, max(4, width // 4), height * columns)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, instances, spatial_shape):
+        delta = self.net(instances)
+        if spatial_shape != self.grid_size:
+            # Treat instance slots as channels so the resizing mixes only space.
+            delta = F.interpolate(delta.unflatten(-1, self.grid_size), size=spatial_shape,
+                                  mode="bilinear", align_corners=False).flatten(-2)
+        return 1 + delta.tanh()
+
+
 class TripletBlock(nn.Module):
     """Eq. (11) with the previously selected position-modulated instance Key."""
     def __init__(self, cfg):
@@ -132,12 +153,17 @@ class TripletBlock(nn.Module):
         self.norm_attention = nn.LayerNorm(cfg.width)
         self.norm_ff = nn.LayerNorm(cfg.width)
 
-    def forward(self, slots, instances, tokens, positions):
+        self.key_gate = None
+
+    def forward(self, slots, instances, tokens, positions, spatial_shape=None):
         query = self.query(slots).unflatten(-1, (self.heads, -1))
         value = self.value(tokens).unflatten(-1, (self.heads, -1))
         # Reassociate q·W_k(f_i ⊙ p_t) to avoid allocating B×N×T×D keys.
         coefficients = torch.einsum("bnhd,hdc->bnhc", query, self.key.weight.unflatten(0, (self.heads, -1)))
         weights = torch.einsum("bnhc,tc->bnht", coefficients * instances[:, :, None], positions)
+        if self.key_gate is not None:
+            # Scalar modulation commutes with the bias-free Key projection.
+            weights = weights * self.key_gate(instances, spatial_shape).unsqueeze(2)
         weights = (weights / query.shape[-1] ** .5).softmax(dim=-1)
         context = torch.einsum("bnht,bthd->bnhd", weights, value).flatten(-2)
         hidden = self.norm_attention(slots + self.readout(context))
@@ -153,10 +179,10 @@ class ViewQueries(nn.Module):
         self.box = mlp(cfg.width, cfg.width, 4)
         self.visibility = mlp(cfg.width, cfg.width, 1)
 
-    def forward(self, instances, tokens, positions):
+    def forward(self, instances, tokens, positions, spatial_shape):
         slots = self.slots.weight[None].expand(tokens.shape[0], -1, -1)
         for block in self.blocks:
-            slots = block(slots, instances, tokens, positions)
+            slots = block(slots, instances, tokens, positions, spatial_shape)
         return self.box(slots).sigmoid(), self.visibility(slots).squeeze(-1)
 
 
@@ -172,6 +198,19 @@ class AssociationNetwork(nn.Module):
         self.fusion = Fusion(cfg)
         self.instances = InstanceQueries(cfg)
         self.views = nn.ModuleList(ViewQueries(cfg) for _ in range(cfg.views))
+        if cfg.learned_key:
+            # Construct the new parameters last so shared weights start identically.
+            for branch in self.views:
+                for block in branch.blocks:
+                    block.key_gate = SpatialKeyGate(cfg.width)
+
+    @torch.no_grad()
+    def initialize_box_size(self, medians):
+        if len(medians) != len(self.views):
+            raise ValueError("Expected one width/height prior per view")
+        for branch, size in zip(self.views, medians):
+            bias = branch.box[-1].bias
+            bias[2:].copy_(bias.new_tensor(size).clamp(1e-6, 1 - 1e-6).logit())
 
     def forward(self, images):
         if images.ndim != 5 or images.shape[1:3] != (self.cfg.views, 3):
@@ -182,6 +221,6 @@ class AssociationNetwork(nn.Module):
         tokens = maps.reshape(b, k, d, h * w).transpose(-2, -1).unbind(1)
         positions = position_grid(h, w, d, maps)
         instances, category = self.instances(self.fusion(tokens), positions)
-        box, visibility = zip(*(branch(instances, view, positions) for branch, view in zip(self.views, tokens)))
+        box, visibility = zip(*(branch(instances, view, positions, (h, w)) for branch, view in zip(self.views, tokens)))
         return {"category": category, "box": torch.stack(box, dim=1),
                 "visibility": torch.stack(visibility, dim=1)}
