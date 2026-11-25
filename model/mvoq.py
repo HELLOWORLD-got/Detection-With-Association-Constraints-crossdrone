@@ -153,6 +153,15 @@ class MultiViewObjectQuery(nn.Module):
             ]
         )
 
+    @torch.no_grad()
+    def initialize_box_size_bias(self, sizes: Sequence[tuple[float, float]]) -> None:
+        """Initialize only the width and height logits from normalized training sizes."""
+        if len(sizes) != self.num_views:
+            raise ValueError("provide one width/height prior per view")
+        for reg_head, size in zip(self.reg_heads, sizes):
+            bias = reg_head[-1].bias
+            bias[2:].copy_(bias.new_tensor(size).clamp(1e-6, 1 - 1e-6).logit())
+
     def forward(
         self,
         instance_features: torch.Tensor,

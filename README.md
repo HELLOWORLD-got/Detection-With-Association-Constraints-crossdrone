@@ -144,3 +144,15 @@ bash train_crossdrone.sh --overfit --limit-train 8 --epochs 100 --workers 2 \
 ```
 
 同图实验的初始和逐轮评估会记录 `raw_best_iou` 与 `raw_oracle_coverage_iou50`。优先按相同训练步数比较这些量和 `mAP50`，再看损失。评估 checkpoint 时会自动使用保存的 Key 设置。
+
+### 框宽高初始化对照
+
+对已跑完的 `position-key` 同图实验，可以只改宽高 bias 再跑一次。每个视图使用本次训练子集内可见框的归一化宽高中位数，排除验证和测试标注。中心 bias、其余权重及损失都沿用默认设置。初始化值写入 `config.json` 和 checkpoint。该选项属于跨无人机小目标诊断，默认采用原初始化。
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 NCCL_P2P_DISABLE=1 bash train_crossdrone.sh \
+  --overfit --limit-train 8 --epochs 100 --workers 2 --validate-before-training \
+  --box-size-prior --output runs/overfit-8-position-size-prior
+```
+
+和既有 `position-key` 的同轮结果对比原始 IoU、IoU≥0.5 覆盖率和 AP50。确认定位能改善后，再用评估报告检查车辆概率和可见性过滤。

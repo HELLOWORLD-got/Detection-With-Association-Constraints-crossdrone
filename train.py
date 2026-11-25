@@ -54,6 +54,8 @@ def parse_args():
                         help="evaluate the initial model on the same validation split before epoch 1")
     parser.add_argument("--overfit", action="store_true",
                         help="diagnostic only: disable augmentation and validate on the same limited training scenes")
+    parser.add_argument("--box-size-prior", action="store_true",
+                        help="ablation: initialize box width/height biases from training medians")
     parser.add_argument("--mvoq-content-key", action="store_true",
                         help="ablation: include local appearance in the MVOQ Key")
     parser.add_argument("--limit-train", type=int, help="limit training scenes for a smoke run")
@@ -91,6 +93,21 @@ def setup_device(spec, world_size, backend=None):
     return device
 
 
+def training_box_size_medians(scenes):
+    medians = []
+    for view in range(NUM_VIEWS):
+        sizes = [
+            (x2 - x1, y2 - y1)
+            for scene in scenes
+            for x1, y1, x2, y2 in scene.boxes[view]
+            if x2 > x1 and y2 > y1
+        ]
+        if not sizes:
+            raise ValueError(f"--box-size-prior: view {view + 1} has no visible training boxes")
+        medians.append(torch.tensor(sizes).quantile(0.5, dim=0).tolist())
+    return medians
+
+
 def run(args, data, audit, splits, world_size, rank, device):
     if args.batch_size % world_size:
         raise ValueError("global --batch-size must be divisible by the process count")
@@ -115,6 +132,10 @@ def run(args, data, audit, splits, world_size, rank, device):
     }
     if args.overfit:
         settings["overfit"] = True
+    if args.box_size_prior:
+        # Match the loader's capacity filtering and sample cap before reading labels.
+        eligible = [scene for scene in data["train"] if len(scene.ids) <= NUM_QUERIES]
+        settings["box_size_prior"] = training_box_size_medians(eligible[:args.limit_train])
     if checkpoint is not None and checkpoint["settings"]["model"].get("mvoq_share_attention", True):
         raise ValueError(
             "This checkpoint uses shared MVOQ attention. Use evaluate.py to inspect it, "
@@ -160,6 +181,11 @@ def run(args, data, audit, splits, world_size, rank, device):
         )
         report_startup(f"Building {model_config.backbone} on {device} using {source}")
     net = build_model(initialization).to(device)
+    if args.box_size_prior and checkpoint is None:
+        sizes = settings["box_size_prior"]
+        net.mvoq.initialize_box_size_bias(sizes)
+        if rank == 0:
+            report_startup(f"Initialized normalized width/height biases from: {sizes}")
     criterion = net.build_criterion()
     optimizer = torch.optim.AdamW(
         (p for p in net.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.weight_decay

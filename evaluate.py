@@ -65,6 +65,8 @@ def main():
               "mvoq_attention_shared": model_settings["mvoq_share_attention"],
               "mvoq_content_key": model_settings.get("mvoq_content_key", False),
               "split": args.split, "dataset_index_changed": dataset_changed, **result}
+    if "box_size_prior" in settings:
+        result["box_size_prior"] = settings["box_size_prior"]
     if args.output:
         write_json(args.output, result)
     print(json.dumps(result, indent=2))
