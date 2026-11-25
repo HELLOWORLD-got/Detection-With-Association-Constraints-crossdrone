@@ -84,11 +84,15 @@ class SetCriterion(nn.Module):
 
             # --- Eq. (24): confidence -------------------------------------
             target_conf = valid.clamp(0.0, 1.0)
-            probs = confidences[b].float().clamp(1e-6, 1.0 - 1e-6)
-            bce = -(
-                target_conf * torch.log(probs)
-                + (1.0 - target_conf) * torch.log(1.0 - probs)
-            )
+            if "confidence_logits" in outputs:
+                bce = F.binary_cross_entropy_with_logits(
+                    outputs["confidence_logits"][b].float(), target_conf, reduction="none"
+                )
+            else:
+                # Compatibility for external callers supplying probabilities only.
+                bce = F.binary_cross_entropy(
+                    confidences[b].float(), target_conf, reduction="none"
+                )
             conf_terms.append(bce.sum() / (num_queries * num_views))
 
         loss_cls = torch.stack(cls_terms).mean()

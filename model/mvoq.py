@@ -168,15 +168,16 @@ class MultiViewObjectQuery(nn.Module):
             [self.reg_heads[k](object_features[:, k]).sigmoid() for k in range(self.num_views)],
             dim=1,
         )
-        confidences = torch.stack(
+        confidence_logits = torch.stack(
             [
-                self.conf_heads[k](object_features[:, k]).sigmoid().squeeze(-1)
+                self.conf_heads[k](object_features[:, k]).squeeze(-1)
                 for k in range(self.num_views)
             ],
             dim=1,
         )
         return {
             "boxes": boxes,
-            "confidences": confidences,
+            "confidence_logits": confidence_logits,
+            "confidences": confidence_logits.sigmoid(),
             "object_features": object_features,
         }

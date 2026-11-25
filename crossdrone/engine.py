@@ -84,11 +84,12 @@ def make_loader(scenes, size, device, batch_size, workers, *,
     )
 
 
-def train_epoch(model, criterion, optimizer, loader, device, epoch, rank, log_every, *, epochs=None):
+def train_epoch(model, criterion, optimizer, loader, device, epoch, rank, log_every, *, epochs=None, inspect_gradients=False):
     model.train()
     epoch_label = str(epoch) if epochs is None else f"{epoch}/{epochs}"
     progress_label = f"Train {epoch_label}" if rank == 0 else None
     fields = ("loss", "loss_cls", "loss_reg", "loss_conf")
+    gradient_norms = {}
     totals = torch.zeros(5, dtype=torch.float32, device=device)
     with BatchProgress(progress_label, len(loader), log_every) as progress:
         for step, (images, targets) in enumerate(loader, 1):
@@ -106,6 +107,14 @@ def train_epoch(model, criterion, optimizer, loader, device, epoch, rank, log_ev
                 ids = ", ".join(f"{t['sequence']}:{t['timestamp']}" for t in targets)
                 raise FloatingPointError(f"non-finite training loss on {ids}")
             loss.backward()
+            # Check before updating parameters; all ranks observe DDP-reduced gradients.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"), error_if_nonfinite=True)
+            if inspect_gradients and step == len(loader):
+                net = model.module if hasattr(model, "module") else model
+                for name in ("backbone", "mvff", "giq", "mvoq"):
+                    grads = [p.grad.detach().float().square().sum()
+                             for p in getattr(net, name).parameters() if p.grad is not None]
+                    gradient_norms[name] = torch.stack(grads).sum().sqrt().item() if grads else None
             optimizer.step()
             totals[:4] += torch.stack([losses[field] for field in fields]).detach() * len(targets)
             totals[4] += len(targets)
@@ -113,12 +122,15 @@ def train_epoch(model, criterion, optimizer, loader, device, epoch, rank, log_ev
                 progress.update(step, f"[yellow]loss {loss.item():.4f}[/yellow]")
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(totals)
-    return dict(zip(fields, (totals[:4] / totals[4]).cpu().tolist()))
+    result = dict(zip(fields, (totals[:4] / totals[4]).cpu().tolist()))
+    if inspect_gradients:
+        result["last_step_gradient_norms"] = gradient_norms
+    return result
 
 
 @torch.inference_mode()
 def evaluate(model, loader, device, confidence_threshold, iou_threshold, predictions=None, *,
-             progress_label=None, log_every=50):
+             progress_label=None, log_every=50, diagnostics=None):
     model.eval()
     association = AssociationMetrics(iou_threshold)
     detection = DetectionMetrics()
@@ -127,6 +139,8 @@ def evaluate(model, loader, device, confidence_threshold, iou_threshold, predict
     with BatchProgress(progress_label, total_steps, log_every, color="green") as progress:
         for step, (images, targets) in enumerate(loader, 1):
             outputs = model(images.to(device, non_blocking=True))
+            if diagnostics is not None:
+                diagnostics.update(outputs, targets)
             for (boxes, scores, present), target in zip(decode(outputs, confidence_threshold), targets):
                 association.update(boxes, present, target)
                 detection.update(boxes, scores, target)

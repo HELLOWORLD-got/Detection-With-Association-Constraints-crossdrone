@@ -4,7 +4,7 @@
 
 ## 安装与运行
 
-服务器上的项目目录包含 `crossdrone-data/` 时，激活已有 Python 环境后使用双卡脚本。脚本使用 GPU 0 和 1，输出到 `runs/crossdrone-resnet50/`。Rich 进度条区分训练和验证，并显示轮次、批次、已用时间、预计剩余时间和训练损失。直接在终端运行时实时刷新，重定向到日志时默认每 50 批及每阶段结束记录一次进度。
+服务器上的项目目录包含 `crossdrone-data/` 时，激活已有 Python 环境后使用双卡脚本。脚本默认使用 GPU 0 和 1，可通过 `CUDA_VISIBLE_DEVICES` 选择其他两张卡。默认输出到 `runs/crossdrone-resnet50/`。Rich 进度条区分训练和验证，并显示轮次、批次、已用时间、预计剩余时间和训练损失。直接在终端运行时实时刷新，重定向到日志时默认每 50 批及每阶段结束记录一次进度。
 
 ```bash
 bash train_crossdrone.sh
@@ -47,6 +47,18 @@ python evaluate.py runs/crossdrone-resnet50/best.pt --split test --device cuda \
 
 每个训练目录保存 `config.json`、`data_audit.json`、`metrics.json`、`last.pt` 和 `best.pt`。最佳断点按验证集 MDA 选取，同分用 mAP。测试使用 `evaluate.py` 单独运行。预测 JSONL 每行对应一个时间戳，包含两个视图的原图像素框、检测分数和关联 ID。指标以 0–1 表示，乘以 100 后可与论文表格的单位对照。
 
+### 小样本性能检查
+
+先在固定的 128 个验证图像对上测初始模型，再用 384 个训练对跑 12 轮。两次评估使用相同阈值、分辨率和验证样本。若服务器需要关闭 NCCL P2P，使用下列命令。
+
+```bash
+NCCL_P2P_DISABLE=1 bash train_crossdrone.sh --validate-before-training \
+  --epochs 12 --limit-train 384 --limit-val 128 \
+  --output runs/learning-check
+```
+
+初始验证写入 `baseline.json`，各轮验证写入 `metrics.json`。对照同一验证集上的 MDA、mAP 和 mAP50。小样本取自各划分的前若干对，受相邻帧和场景分布影响。
+
 ## 数据和划分
 
 - 路径使用 `数据集/<序列>/<1|2>/<timestamp>.png` 和 `数据集/<序列>/<序列>.xml`。精确匹配时间戳字符串。两视图按原始车辆 ID 取并集，`outside=0` 且裁剪到图像后面积为正的框记为可见。
@@ -80,3 +92,39 @@ python -m unittest discover -s tests
 ```
 
 [论文 DOI](https://doi.org/10.1109/TGRS.2026.3724951) · [作者公开代码](https://github.com/yyyyyxq/Instance-based-Association)
+
+## 零指标排查（修复后）
+
+本次修复：置信度使用原始 logits 计算稳定 BCE，避免 clamp 截断错误高置信度预测的梯度；冻结骨干时同时固定 BatchNorm 状态；微小框 GIoU 避免固定面积下限产生虚假误差；Hungarian 非有限代价立即报错，反向传播后检查梯度再更新参数。模型参数形状不变，可以直接加载旧 `last.pt`。这些修复不等于已经证明服务器上的零 AP 根因，也不保证恢复旧断点后立即收敛。
+
+`evaluate.py --split val` 默认继承 checkpoint 的 `limit_val`；`--split train` 先按 N=25 排除超容量帧，再继承 `limit_train`，关闭数据增强。`--limit N` 显式覆盖；`--full` 取消限额。独立评估记录 checkpoint epoch 和数据索引变化。过拟合诊断的 val 始终来自该实验的训练子集，不能当作独立验证成绩。
+
+同步代码到服务器后，在项目根目录和已有环境中执行：
+
+```bash
+# 1. 回归测试；依赖沿用 requirements.txt。
+python -m unittest discover -s tests
+
+# 2. 诊断已有的小样本实验，使用最后一轮权重。
+# 全部指标为零时 best.pt 可能仍然是第 1 轮。
+CUDA_VISIBLE_DEVICES=2,3 bash debug_crossdrone.sh diagnose \
+  runs/convergence-gpu23/last.pt runs/diagnostics-existing
+
+# 3. 新开实验：8 个图像对，关闭增强，同图评估，保留默认分辨率、学习率、N=25。
+# 两张 GPU；默认关闭 NCCL P2P。200 轮是诊断预算，不是论文正式训练配置。
+CUDA_VISIBLE_DEVICES=2,3 bash debug_crossdrone.sh overfit runs/overfit-8-fixed
+```
+
+`diagnose` 使用第一张可见卡单进程运行；训练和验证使用各自保存的样本限额，输出 `train.json`、`val.json` 及各自日志。`overfit` 使用双卡，输出 `baseline.json`、`metrics.json`、`last.pt`、`best.pt`、`train.log`，完成后自动输出诊断。请使用新输出目录，并确认 GPU 没有被其他实验占用。中途报错时保留 `train.log`，不自动重试掩盖问题。
+
+JSON 的 `diagnostics.summary` 中：
+
+- `raw_oracle_coverage_iou50`：忽略所有置信度，GT 是否至少被一个预测框以 IoU≥0.5 覆盖。它允许同一个预测覆盖多个 GT，**不是正式召回率**。
+- `kept_oracle_coverage_iou50`：经过车辆/可见性阈值后剩余框的覆盖率。raw 高、kept 低，优先检查分类和可见性；两者都低，优先检查定位。
+- `raw_best_iou`、`pred_width_px` / `gt_width_px`、`pred_height_px` / `gt_height_px`：定位和尺寸分布。像素单位使用原图尺寸。
+- `foreground_probability`、`visibility_probability`、`confidence_abs_logit`：置信度分布；logit 绝对值很大时检查是否饱和。
+- `center_error_px`、`size_error_px`：选择每个 GT 的最大 IoU 框计算平均绝对坐标误差；所有 IoU 为零时选择任意并列框，不能单独用这一项下结论。
+
+`diagnostics.frames` 记录逐帧、逐视图结果和样本标识，便于找出异常标注或场景。过拟合实验还在每轮 `train.last_step_gradient_norms` 保存最后一步各模块梯度范数；`null` 表示没有梯度，0 表示该步范数为零，连续异常才值得进一步排查。
+
+判断顺序：先确认数据索引、样本数和 checkpoint epoch；再看同图训练的框覆盖率和 AP 是否上升。如果同图可以拟合而独立验证差，检查场景分布及小样本代表性。如果同图长期无法拟合且原始覆盖率接近零，继续检查框预测与 MVOQ 注意力的学习能力，并做独立消融。这里仍使用已确认的位置调制 Key 方案，不因指标低而自动改变论文公式或扩充查询数。正式复现时不要启用 `--overfit`。

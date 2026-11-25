@@ -36,6 +36,7 @@ class ConflictFreeMultiViewAssociation(nn.Module):
             config.backbone, config.hidden_dim, config.pretrained
         )
         if config.freeze_backbone:
+            self.backbone.eval()
             for parameter in self.backbone.parameters():
                 parameter.requires_grad_(False)
 
@@ -67,6 +68,12 @@ class ConflictFreeMultiViewAssociation(nn.Module):
         )
 
     # ------------------------------------------------------------------ #
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.config.freeze_backbone:
+            self.backbone.eval()
+        return self
+
     def _as_view_list(self, images) -> list[torch.Tensor]:
         if isinstance(images, torch.Tensor):
             if images.dim() != 5:
@@ -107,6 +114,7 @@ class ConflictFreeMultiViewAssociation(nn.Module):
             "instance_features": giq_output["instance_features"],
             "boxes": mvoq_output["boxes"],
             "confidences": mvoq_output["confidences"],
+            "confidence_logits": mvoq_output["confidence_logits"],
             "global_feature": global_feature,
             "view_features": view_features,
         }

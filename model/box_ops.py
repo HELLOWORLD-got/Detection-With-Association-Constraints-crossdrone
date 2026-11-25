@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-EPS = 1e-7
+EPS = torch.finfo(torch.float32).tiny
 
 
 def box_xywh_to_xyxy(boxes: torch.Tensor, *, clip: bool = True) -> torch.Tensor:

@@ -49,6 +49,10 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", help="resume from OUTPUT/last.pt")
     parser.add_argument("--audit-only", action="store_true", help="report XML and split coverage")
     parser.add_argument("--random-init", action="store_true", help="initialize without ImageNet weights")
+    parser.add_argument("--validate-before-training", action="store_true",
+                        help="evaluate the initial model on the same validation split before epoch 1")
+    parser.add_argument("--overfit", action="store_true",
+                        help="diagnostic only: disable augmentation and validate on the same limited training scenes")
     parser.add_argument("--limit-train", type=int, help="limit training scenes for a smoke run")
     parser.add_argument("--limit-val", type=int, help="limit validation scenes for a smoke run")
     args = parser.parse_args()
@@ -62,6 +66,8 @@ def parse_args():
         parser.error("invalid workers, logging interval or scene limit")
     if not (0 <= args.confidence_threshold <= 1 and 0 < args.association_iou <= 1):
         parser.error("invalid confidence or association IoU threshold")
+    if args.overfit and (args.limit_train is None or args.limit_val is not None):
+        parser.error("--overfit requires --limit-train and no --limit-val")
     return args
 
 
@@ -104,6 +110,8 @@ def run(args, data, audit, splits, world_size, rank, device):
         "association_iou": args.association_iou, "limit_train": args.limit_train,
         "limit_val": args.limit_val, "world_size": world_size,
     }
+    if args.overfit:
+        settings["overfit"] = True
     if checkpoint is not None and checkpoint["settings"] != settings:
         raise ValueError("resume settings or indexed data differ from the saved run")
     if checkpoint is not None and checkpoint["epoch"] >= args.epochs:
@@ -112,13 +120,18 @@ def run(args, data, audit, splits, world_size, rank, device):
     loader = make_loader(data["train"], args.size, device, batch_size, args.workers,
                          training=True, limit=args.limit_train, rank=rank,
                          world_size=world_size, seed=args.seed)
+    if args.overfit:
+        loader.dataset.training = False
     if rank == 0:
-        val_loader = make_loader(data["val"], args.size, device, batch_size, args.workers,
+        val_scenes = loader.dataset.scenes if args.overfit else data["val"]
+        val_loader = make_loader(val_scenes, args.size, device, batch_size, args.workers,
                                  limit=args.limit_val)
         output.mkdir(parents=True, exist_ok=True)
         audit["training_eligible"] = audit["splits"]["train"]["complete"] - audit["splits"]["train"]["over_capacity"]
         audit["training_used"] = len(loader.dataset)
         audit["validation_used"] = len(val_loader.dataset)
+        if args.overfit:
+            report_startup("OVERFIT DIAGNOSTIC: augmentation disabled; validation uses training images")
         report_startup(
             f"Data ready: {len(loader.dataset)} training pairs, {len(val_loader.dataset)} validation pairs"
         )
@@ -156,6 +169,18 @@ def run(args, data, audit, splits, world_size, rank, device):
     model = DistributedDataParallel(
         net, device_ids=[device.index] if device.type == "cuda" else None
     ) if world_size > 1 else net
+    if args.validate_before_training and start_epoch == 1:
+        if rank == 0:
+            report_startup("Evaluating the initial model before training")
+            baseline = evaluate(
+                net, val_loader, device, args.confidence_threshold, args.association_iou,
+                progress_label="Val baseline", log_every=args.log_every,
+            )
+            record = {"epoch": 0, "val": baseline}
+            write_json(output / "baseline.json", record)
+            print(json.dumps(record), flush=True)
+        if world_size > 1:
+            dist.barrier()
     if rank == 0:
         report_startup(f"Starting epoch {start_epoch}/{args.epochs} and loading its first batch")
 
@@ -166,7 +191,8 @@ def run(args, data, audit, splits, world_size, rank, device):
         if isinstance(loader.sampler, torch.utils.data.DistributedSampler):
             loader.sampler.set_epoch(epoch)
         losses = train_epoch(
-            model, criterion, optimizer, loader, device, epoch, rank, args.log_every, epochs=args.epochs
+            model, criterion, optimizer, loader, device, epoch, rank, args.log_every, epochs=args.epochs,
+            inspect_gradients=args.overfit,
         )
         if rank == 0:
             validation = evaluate(

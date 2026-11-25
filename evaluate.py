@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 
 from crossdrone.data import index_dataset
+from crossdrone.diagnostics import Diagnostics, evaluation_scenes
 from crossdrone.engine import evaluate, make_loader, resolve_device, write_json
 from model import ModelConfig, build_model
 
@@ -18,11 +19,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--data", type=Path, default=Path("数据集"))
-    parser.add_argument("--split", choices=("val", "test"), default="test")
+    parser.add_argument("--split", choices=("train", "val", "test"), default="test")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--limit", type=int, help="limit scenes for a smoke run")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--limit", type=int, help="override checkpoint scene limit")
+    selection.add_argument("--full", action="store_true", help="ignore saved scene limit")
+    parser.add_argument("--diagnostics", action="store_true", help="include raw box and score diagnostics")
     parser.add_argument("--output", type=Path, help="write evaluation metrics as JSON")
     parser.add_argument("--predictions", type=Path, help="export per-frame predictions as JSONL")
     args = parser.parse_args()
@@ -37,10 +41,12 @@ def main():
     dataset_changed = audit["annotation_and_availability_sha256"] != settings["annotation_and_availability_sha256"]
     device = resolve_device(args.device)
     loader = make_loader(
-        data[args.split], settings["size"], device, args.batch_size, args.workers, limit=args.limit
+        evaluation_scenes(data, settings, args.split, args.limit, args.full),
+        settings["size"], device, args.batch_size, args.workers
     )
     net = build_model(ModelConfig(**{**settings["model"], "pretrained": False}))
     net.load_state_dict(checkpoint["model"])
+    epoch = checkpoint["epoch"]
     del checkpoint
     net.to(device)
     for path in (args.output, args.predictions):
@@ -48,9 +54,13 @@ def main():
             path.parent.mkdir(parents=True, exist_ok=True)
 
     predictions = args.predictions.open("w", encoding="utf-8") if args.predictions else nullcontext()
+    diagnostics = Diagnostics(settings["confidence_threshold"]) if args.diagnostics else None
     with predictions as stream:
-        result = evaluate(net, loader, device, settings["confidence_threshold"], settings["association_iou"], stream)
-    result = {"split": args.split, "dataset_index_changed": dataset_changed, **result}
+        result = evaluate(net, loader, device, settings["confidence_threshold"], settings["association_iou"], stream,
+                          progress_label=f"Eval {args.split}", diagnostics=diagnostics)
+    if diagnostics is not None:
+        result["diagnostics"] = diagnostics.compute()
+    result = {"checkpoint_epoch": epoch, "overfit_run": settings.get("overfit", False), "split": args.split, "dataset_index_changed": dataset_changed, **result}
     if args.output:
         write_json(args.output, result)
     print(json.dumps(result, indent=2))

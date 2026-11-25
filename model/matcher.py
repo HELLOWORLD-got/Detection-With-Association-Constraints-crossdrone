@@ -33,6 +33,8 @@ def _hungarian_numpy(cost_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if cost.shape[0] > cost.shape[1]:
         cost = cost.T
         transposed = True
+    if not np.isfinite(cost).all():
+        raise ValueError("assignment cost contains NaN or infinity")
     n, m = cost.shape
 
     u = np.zeros(n + 1)
@@ -87,7 +89,9 @@ def _hungarian_numpy(cost_matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 def linear_sum_assignment(cost_matrix: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
     """Assignment minimising the total cost; scipy if importable, else fallback."""
-    array = cost_matrix.detach().cpu().numpy()
+    array = cost_matrix.detach().float().cpu().numpy()
+    if not np.isfinite(array).all():
+        raise ValueError("assignment cost contains NaN or infinity")
     try:
         from scipy.optimize import linear_sum_assignment as scipy_assignment
 
