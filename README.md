@@ -130,3 +130,17 @@ JSON 的 `diagnostics.summary` 中：
 `diagnostics.frames` 记录逐帧、逐视图结果和样本标识，便于找出异常标注或场景。过拟合实验还在每轮 `train.last_step_gradient_norms` 保存最后一步各模块梯度范数；`null` 表示没有梯度，0 表示该步范数为零，连续异常才值得进一步排查。
 
 判断顺序：先确认数据索引、样本数和 checkpoint epoch；再看同图训练的框覆盖率和 AP 是否上升。如果同图可以拟合而独立验证差，检查场景分布及小样本代表性。如果同图长期无法拟合且原始覆盖率接近零，继续检查框预测与 MVOQ 注意力的学习能力，并做独立消融。这里仍使用已确认的位置调制 Key 方案，不因指标低而自动改变论文公式或扩充查询数。正式复现时不要启用 `--overfit`。
+
+### MVOQ 局部特征对照
+
+定位实验可以在相同样本、种子和训练轮数下，比较默认的位置调制 Key 与加入局部外观的 Key。两者都使用每视图独立的 CA。后者通过 `--mvoq-content-key` 启用，把当前视图的空间特征加到位置编码后，再用对应的全局实例特征调制。参数形状相同，属于对式 (11) 未公开细节的消融。默认训练使用位置调制 Key。
+
+```bash
+export CUDA_VISIBLE_DEVICES=2,3 NCCL_P2P_DISABLE=1
+bash train_crossdrone.sh --overfit --limit-train 8 --epochs 100 --workers 2 \
+  --validate-before-training --output runs/overfit-8-position-key
+bash train_crossdrone.sh --overfit --limit-train 8 --epochs 100 --workers 2 \
+  --validate-before-training --mvoq-content-key --output runs/overfit-8-content-key
+```
+
+同图实验的初始和逐轮评估会记录 `raw_best_iou` 与 `raw_oracle_coverage_iou50`。优先按相同训练步数比较这些量和 `mAP50`，再看损失。评估 checkpoint 时会自动使用保存的 Key 设置。

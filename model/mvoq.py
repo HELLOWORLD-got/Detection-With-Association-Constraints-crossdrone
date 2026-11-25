@@ -29,11 +29,13 @@ class TripletAttentionBlock(nn.Module):
         num_heads: int = 8,
         ffn_ratio: int = 4,
         dropout: float = 0.1,
+        content_key: bool = False,
     ) -> None:
         super().__init__()
         if num_heads < 1 or dim % num_heads:
             raise ValueError("dim must be divisible by a positive num_heads")
         self.num_heads = num_heads
+        self.content_key = content_key
         self.head_dim = dim // num_heads
         self.position_encoding = PositionEncoding2D(dim)
         self.query_projection = nn.Linear(dim, dim)
@@ -73,8 +75,14 @@ class TripletAttentionBlock(nn.Module):
         key_weights = self.key_projection.weight.view(self.num_heads, self.head_dim, dim)
         query_in_key_space = torch.einsum("bnhd,hdc->bnhc", query, key_weights)
         modulated = query_in_key_space * instance_features.to(query.dtype).unsqueeze(2)
-        scores = torch.einsum("bnhc,tc->bhnt", modulated, positions) * self.head_dim ** -0.5
-        weights = self.attention_dropout(scores.softmax(dim=-1))
+        if self.content_key:
+            # Ablation: spatial Key = W_k(f_i ⊙ (p_t + F_k,t)).
+            # Reuse the same parameters and Value path as the position-only Key.
+            key_tokens = positions + view_tokens.to(query.dtype)
+            scores = torch.einsum("bnhc,btc->bhnt", modulated, key_tokens)
+        else:
+            scores = torch.einsum("bnhc,tc->bhnt", modulated, positions)
+        weights = self.attention_dropout((scores * self.head_dim ** -0.5).softmax(dim=-1))
         context = torch.einsum("bhnt,bthd->bnhd", weights, value)
         attended = self.output_projection(context.reshape(batch, instances, dim))
         x = self.norm1(object_queries + self.drop1(attended))
@@ -93,6 +101,7 @@ class MultiViewObjectQuery(nn.Module):
         ffn_ratio: int = 4,
         dropout: float = 0.1,
         share_attention: bool = False,
+        content_key: bool = False,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -105,7 +114,7 @@ class MultiViewObjectQuery(nn.Module):
         )
         def attention_stack():
             return nn.ModuleList(
-                TripletAttentionBlock(dim, num_heads, ffn_ratio, dropout)
+                TripletAttentionBlock(dim, num_heads, ffn_ratio, dropout, content_key=content_key)
                 for _ in range(num_layers)
             )
 

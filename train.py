@@ -16,6 +16,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from crossdrone.data import NUM_QUERIES, NUM_VIEWS, SPLITS, index_dataset
+from crossdrone.diagnostics import Diagnostics
 from crossdrone.engine import evaluate, make_loader, resolve_device, save_checkpoint, train_epoch, write_json
 from model import ModelConfig, TrainConfig, build_model
 
@@ -53,6 +54,8 @@ def parse_args():
                         help="evaluate the initial model on the same validation split before epoch 1")
     parser.add_argument("--overfit", action="store_true",
                         help="diagnostic only: disable augmentation and validate on the same limited training scenes")
+    parser.add_argument("--mvoq-content-key", action="store_true",
+                        help="ablation: include local appearance in the MVOQ Key")
     parser.add_argument("--limit-train", type=int, help="limit training scenes for a smoke run")
     parser.add_argument("--limit-val", type=int, help="limit validation scenes for a smoke run")
     args = parser.parse_args()
@@ -99,7 +102,7 @@ def run(args, data, audit, splits, world_size, rank, device):
 
     model_config = ModelConfig(
         backbone=args.backbone, num_classes=1, num_views=NUM_VIEWS, num_queries=NUM_QUERIES,
-        pretrained=not args.random_init,
+        pretrained=not args.random_init, mvoq_content_key=args.mvoq_content_key,
     )
     settings = {
         "model": asdict(model_config), "size": list(args.size),
@@ -117,6 +120,8 @@ def run(args, data, audit, splits, world_size, rank, device):
             "This checkpoint uses shared MVOQ attention. Use evaluate.py to inspect it, "
             "or choose a new --output and train the per-view architecture from initialization."
         )
+    if checkpoint is not None:
+        checkpoint["settings"]["model"].setdefault("mvoq_content_key", False)
     if checkpoint is not None and checkpoint["settings"] != settings:
         raise ValueError("resume settings or indexed data differ from the saved run")
     if checkpoint is not None and checkpoint["epoch"] >= args.epochs:
@@ -174,13 +179,22 @@ def run(args, data, audit, splits, world_size, rank, device):
     model = DistributedDataParallel(
         net, device_ids=[device.index] if device.type == "cuda" else None
     ) if world_size > 1 else net
+    def validate(label):
+        diagnostics = Diagnostics(args.confidence_threshold) if args.overfit else None
+        result = evaluate(
+            net, val_loader, device, args.confidence_threshold, args.association_iou,
+            progress_label=label, log_every=args.log_every, diagnostics=diagnostics,
+        )
+        if diagnostics is not None:
+            summary = diagnostics.compute()["summary"]
+            result["raw_best_iou"] = summary["raw_best_iou"]
+            result["raw_oracle_coverage_iou50"] = summary["raw_oracle_coverage_iou50"]
+        return result
+
     if args.validate_before_training and start_epoch == 1:
         if rank == 0:
             report_startup("Evaluating the initial model before training")
-            baseline = evaluate(
-                net, val_loader, device, args.confidence_threshold, args.association_iou,
-                progress_label="Val baseline", log_every=args.log_every,
-            )
+            baseline = validate("Val baseline")
             record = {"epoch": 0, "val": baseline}
             write_json(output / "baseline.json", record)
             print(json.dumps(record), flush=True)
@@ -200,10 +214,7 @@ def run(args, data, audit, splits, world_size, rank, device):
             inspect_gradients=args.overfit,
         )
         if rank == 0:
-            validation = evaluate(
-                net, val_loader, device, args.confidence_threshold, args.association_iou,
-                progress_label=f"Val {epoch}/{args.epochs}", log_every=args.log_every,
-            )
+            validation = validate(f"Val {epoch}/{args.epochs}")
             record = {"epoch": epoch, "train": losses, "val": validation}
             history.append(record)
             score = (validation["MDA"], validation["mAP"] or 0.0)

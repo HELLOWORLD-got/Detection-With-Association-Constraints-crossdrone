@@ -62,7 +62,9 @@ def main():
     if diagnostics is not None:
         result["diagnostics"] = diagnostics.compute()
     result = {"checkpoint_epoch": epoch, "overfit_run": settings.get("overfit", False),
-              "mvoq_attention_shared": model_settings["mvoq_share_attention"], "split": args.split, "dataset_index_changed": dataset_changed, **result}
+              "mvoq_attention_shared": model_settings["mvoq_share_attention"],
+              "mvoq_content_key": model_settings.get("mvoq_content_key", False),
+              "split": args.split, "dataset_index_changed": dataset_changed, **result}
     if args.output:
         write_json(args.output, result)
     print(json.dumps(result, indent=2))
