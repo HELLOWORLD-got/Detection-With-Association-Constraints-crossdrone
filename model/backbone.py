@@ -10,9 +10,24 @@ Spatial reduction: ResNet-50 -> /32, ViT-B/16 -> /16.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+WEIGHTS_DIR = Path(__file__).resolve().parents[1] / "weights"
+
+
+def _build_torchvision_model(factory, weights):
+    if weights is not None:
+        local_file = WEIGHTS_DIR / weights.url.rsplit("/", 1)[-1]
+        if local_file.is_file():
+            model = factory(weights=None)
+            model.load_state_dict(torch.load(local_file, map_location="cpu", weights_only=True))
+            return model
+    return factory(weights=weights)
 
 
 class ResNetBackbone(nn.Module):
@@ -25,7 +40,7 @@ class ResNetBackbone(nn.Module):
         from torchvision.models import ResNet50_Weights, resnet50
 
         weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
-        net = resnet50(weights=weights)
+        net = _build_torchvision_model(resnet50, weights)
         # Everything up to and including layer4: stride 32, 2048 channels.
         self.stem = nn.Sequential(
             net.conv1,
@@ -59,7 +74,7 @@ class ViTBackbone(nn.Module):
         from torchvision.models import ViT_B_16_Weights, vit_b_16
 
         weights = ViT_B_16_Weights.IMAGENET1K_V1 if pretrained else None
-        self.vit = vit_b_16(weights=weights)
+        self.vit = _build_torchvision_model(vit_b_16, weights)
         self.vit.heads.requires_grad_(False)  # The patch-feature path bypasses the classifier.
         self.channels = 768
         self.patch = 16

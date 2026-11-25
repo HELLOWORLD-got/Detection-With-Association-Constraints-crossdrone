@@ -36,7 +36,7 @@ python evaluate.py runs/crossdrone-resnet50/best.pt --split test --device cuda \
   --predictions runs/crossdrone-resnet50/test-predictions.jsonl
 ```
 
-训练默认使用 ImageNet 预训练权重。离线环境可将 `resnet50-11ad3fa6.pth` 或 `vit_b_16-c867db91.pth` 放入 `$TORCH_HOME/hub/checkpoints/`。未设置 `TORCH_HOME` 时使用 PyTorch Hub 的默认缓存路径。CPU 快速验证可使用 `--device cpu --random-init --size 64 96 --workers 0 --epochs 1 --limit-train 4 --limit-val 4` 并指定单独的输出目录。
+训练默认使用 ImageNet 预训练权重。手动下载的文件可直接放在项目根目录的 `weights/` 内，默认 ResNet-50 使用 `resnet50-11ad3fa6.pth`，ViT-B/16 使用 `vit_b_16-c867db91.pth`。项目目录缺少对应文件时，TorchVision 会检查 PyTorch Hub 缓存，并在需要时下载。CPU 快速验证可使用 `--device cpu --random-init --size 64 96 --workers 0 --epochs 1 --limit-train 4 --limit-val 4` 并指定单独的输出目录。
 
 每个训练目录保存 `config.json`、`data_audit.json`、`metrics.json`、`last.pt` 和 `best.pt`。最佳断点按验证集 MDA 选取，同分用 mAP。测试使用 `evaluate.py` 单独运行。预测 JSONL 每行对应一个时间戳，包含两个视图的原图像素框、检测分数和关联 ID。指标以 0–1 表示，乘以 100 后可与论文表格的单位对照。
 

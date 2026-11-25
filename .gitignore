@@ -4,3 +4,4 @@ __pycache__/
 /runs/
 /数据集/
 /crossdrone-data/
+/weights/
